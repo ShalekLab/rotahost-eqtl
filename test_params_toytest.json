@@ -1,0 +1,20 @@
+{
+  "rotahost_eqtl.analysis_mode": "global",
+  "rotahost_eqtl.cell_types": ["B"],
+  "rotahost_eqtl.chromosomes": ["22"],
+  "rotahost_eqtl.n_permutations": 10,
+  "rotahost_eqtl.maf_filter": 0.05,
+  "rotahost_eqtl.hwe_filter": 0.0001,
+  "rotahost_eqtl.cis_window": 1000000,
+  "rotahost_eqtl.gcs_bgen_prefix": "gs://fc-secure-bfe7bb35-d207-485b-97b3-c66bc870f231/sc_eQTL/genotypes/bgen/",
+  "rotahost_eqtl.gcs_kinship_tsv": "gs://fc-secure-bfe7bb35-d207-485b-97b3-c66bc870f231/sc_eQTL/genotypes/kinship/kinship_matrix.tsv",
+  "rotahost_eqtl.gene_annotation_tsv": "gs://fc-secure-bfe7bb35-d207-485b-97b3-c66bc870f231/sc_eQTL/limix_inputs/gene_annotation_L1.tsv",
+  "rotahost_eqtl.sample_mapping_tsv": "gs://fc-secure-bfe7bb35-d207-485b-97b3-c66bc870f231/sc_eQTL/limix_inputs/sample_mapping_noheader.tsv",
+  "rotahost_eqtl.gcs_phenotype_dir": "gs://fc-secure-bfe7bb35-d207-485b-97b3-c66bc870f231/sc_eQTL/limix_inputs/phenotypes_L1",
+  "rotahost_eqtl.gcs_covariate_dir": "gs://fc-secure-bfe7bb35-d207-485b-97b3-c66bc870f231/sc_eQTL/limix_inputs/covariates_L1/k10",
+  "rotahost_eqtl.docker_image": "ghcr.io/shaleklab/rotahost-eqtl:latest",
+  "rotahost_eqtl.cpu": 2,
+  "rotahost_eqtl.mem_gb": 8,
+  "rotahost_eqtl.disk_gb": 30,
+  "rotahost_eqtl.preemptible_tries": 3
+}

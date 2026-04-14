@@ -1,0 +1,11 @@
+version: 1.2
+workflows:
+  - name: rotahost-eqtl
+    subclass: WDL
+    primaryDescriptorPath: /terra/rotahost_eqtl.wdl
+    testParameterFiles:
+      - /terra/test_params_toytest.json
+      - /terra/test_params_global.json
+    publish: true
+    topic: "RotaHost sc-eQTL + sc-pQTL pipeline (sc-eQTLGen WG3 approach). Supports global cis-eQTL, longitudinal, IgA interaction, temporal, and protein QTL analyses for single-cell data."
+    latestTagAsDefault: true

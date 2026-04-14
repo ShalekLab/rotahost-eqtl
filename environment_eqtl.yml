@@ -1,0 +1,20 @@
+name: eqtl
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy<2.0         # limix_qtl compatibility (ndarray_listener issue)
+  - pandas>=1.5
+  - scipy>=1.9
+  - scikit-learn>=1.1
+  - h5py>=3.7
+  - bgen-reader>=4.0
+  - glimix-core>=3.1.14
+  - ndarray-listener>=2.0
+  - statsmodels>=0.13
+  - pip
+  - pip:
+    - tables==3.11.1
+    - pandas-plink>=2.3

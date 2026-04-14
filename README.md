@@ -49,4 +49,4 @@ Expected: ~2-3 hours per mode, ~$7-10 per mode on preemptible VMs
 If you use this pipeline, please cite:
 - Kaptijn et al. 2026 (sc-eQTLGen consortium)
 - Cuomo et al. 2021 (limix_qtl)
-- Triana et al. (RotaHost, in preparation)
+- Guzman, Triana et al. (RotaHost, in preparation)

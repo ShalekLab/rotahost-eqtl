@@ -133,6 +133,7 @@ workflow rotahost_eqtl {
         Array[Array[File]] log_files    = run_eqtl_task.log_file
         Array[File]        top_results  = merge_results.top_results
         Array[File]        merged_h5    = merge_results.merged_h5
+        Array[File]        metrics      = merge_results.metrics
     }
 
     meta {
@@ -353,13 +354,17 @@ task merge_results {
         String      analysis_mode
         String      interaction_term
         String      docker_image
-        # Optional GCS folder to copy merged h5 (e.g. "gs://fc-.../results/eqtl")
+        # Optional GCS folder to copy all 3 output files
+        # e.g. "gs://fc-secure-.../eqtl_results"
+        # All 35 runs (7 CT × 5 analyses) can share one folder — filenames are unique
         String      results_gcs_dir = ""
         Int         disk_gb         = 50
     }
 
-    String h5_prefix = if (interaction_term != "") then "iqtl" else "eqtl"
-    String merged_h5_name = "~{h5_prefix}_~{cell_type}_~{analysis_mode}_merged.h5"
+    String h5_prefix       = if (interaction_term != "") then "iqtl" else "eqtl"
+    String merged_h5_name  = "~{h5_prefix}_~{cell_type}_~{analysis_mode}_merged.h5"
+    String top_results_name = "~{h5_prefix}_~{cell_type}_~{analysis_mode}_top_results.tsv"
+    String metrics_name     = "~{h5_prefix}_~{cell_type}_~{analysis_mode}_metrics.tsv"
 
     command <<<
         set -euo pipefail
@@ -370,7 +375,9 @@ task merge_results {
         h5_paths = "~{sep=' ' h5_files}".split()
         cell_type = "~{cell_type}"
         analysis = "~{analysis_mode}"
-        merged_name = "~{merged_h5_name}"
+        merged_name     = "~{merged_h5_name}"
+        top_results_name = "~{top_results_name}"
+        metrics_name    = "~{metrics_name}"
         results_gcs_dir = "~{results_gcs_dir}".strip()
 
         print(f"Merging {len(h5_paths)} h5 files for {cell_type} ({analysis})")
@@ -403,8 +410,11 @@ task merge_results {
 
         if len(rows) == 0:
             print("WARNING: No genes found in any h5 file")
-            with open("top_results.tsv", 'w') as f:
+            with open(top_results_name, 'w') as f:
                 f.write(header + "\tfdr_gene\n")
+            with open(metrics_name, 'w') as f:
+                f.write("cell_type\tanalysis_mode\tn_genes\tn_egenes_05\tn_egenes_20\ttop_gene\ttop_emp_p\n")
+                f.write(f"{cell_type}\t{analysis}\t0\t0\t0\tNA\tNA\n")
             sys.exit(0)
 
         # Sort by empirical p-value
@@ -422,35 +432,46 @@ task merge_results {
             cummin = min(cummin, bh)
             fdr[idx] = min(cummin, 1.0)
 
-        n_egenes = int(np.sum(fdr < 0.05))
-        print(f"  eGenes (FDR<0.05): {n_egenes}")
+        n_egenes_05 = int(np.sum(fdr < 0.05))
+        n_egenes_20 = int(np.sum(fdr < 0.20))
+        print(f"  eGenes (FDR<0.05): {n_egenes_05} | eGenes (FDR<0.20): {n_egenes_20}")
 
-        with open("top_results.tsv", 'w') as f:
+        # top_results tsv — best SNP per gene + FDR, named uniquely
+        with open(top_results_name, 'w') as f:
             f.write(header + "\tfdr_gene\n")
             for i, row in enumerate(rows):
                 f.write("\t".join(str(x) for x in row) + f"\t{fdr[i]:.6g}\n")
+        print(f"  Written to {top_results_name}")
 
-        print(f"  Written to top_results.tsv")
+        # metrics tsv — one-line summary for quick QC
+        top_gene = rows[0][0]
+        top_emp_p = rows[0][5]
+        with open(metrics_name, 'w') as f:
+            f.write("cell_type\tanalysis_mode\tn_genes\tn_egenes_05\tn_egenes_20\ttop_gene\ttop_emp_p\n")
+            f.write(f"{cell_type}\t{analysis}\t{n}\t{n_egenes_05}\t{n_egenes_20}\t{top_gene}\t{top_emp_p:.6g}\n")
+        print(f"  Written to {metrics_name}")
 
-        # Copy merged h5 to user-specified GCS folder if provided
+        # Upload all 3 files to results_gcs_dir if provided
         if results_gcs_dir:
             from google.cloud import storage
-            dest = results_gcs_dir.rstrip("/") + "/" + merged_name
-            # dest = "gs://bucket/path/file.h5" → bucket + blob
-            dest_no_prefix = dest[len("gs://"):]
-            bucket_name, blob_path = dest_no_prefix.split("/", 1)
             client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(blob_path)
-            blob.upload_from_filename(merged_name)
-            print(f"  Uploaded merged h5 to {dest}")
+            base = results_gcs_dir.rstrip("/")
+            for local_file in [merged_name, top_results_name, metrics_name]:
+                dest = base + "/" + local_file
+                dest_no_prefix = dest[len("gs://"):]
+                bucket_name, blob_path = dest_no_prefix.split("/", 1)
+                bucket = client.bucket(bucket_name)
+                blob = bucket.blob(blob_path)
+                blob.upload_from_filename(local_file)
+                print(f"  Uploaded {local_file} → {dest}")
 
         EOF
     >>>
 
     output {
-        File top_results = "top_results.tsv"
+        File top_results = top_results_name
         File merged_h5   = merged_h5_name
+        File metrics     = metrics_name
     }
 
     runtime {
@@ -462,6 +483,6 @@ task merge_results {
     }
 
     meta {
-        description: "Merge per-window eQTL h5 results (full variant stats) and compute genome-wide BH-FDR."
+        description: "Merge per-window eQTL h5 results (full variant stats), compute genome-wide BH-FDR, write metrics summary."
     }
 }

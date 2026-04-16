@@ -384,6 +384,7 @@ task merge_results {
 
         header = "feature_id\tsnp_id\tp_value\tbeta\tbeta_se\tempirical_feature_p_value\tn_snps_tested"
         rows = []
+        seen_genes = set()  # genes appear in multiple windows due to ±cis_window overlap
 
         # Write merged h5 (all variants for all genes — full summary stats for plotting/colocalization)
         with h5py.File(merged_name, 'w') as out_f:
@@ -391,8 +392,9 @@ task merge_results {
                 with h5py.File(h5_path, 'r') as f:
                     for gene in f.keys():
                         data = f[gene][:]
-                        if len(data) == 0:
+                        if len(data) == 0 or gene in seen_genes:
                             continue
+                        seen_genes.add(gene)
                         out_f.create_dataset(gene, data=data)
                         best_idx = int(np.argmin(data['empirical_feature_p_value']))
                         rows.append((

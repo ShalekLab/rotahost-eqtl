@@ -102,6 +102,7 @@ workflow rotahost_eqtl {
                     bgen_bgi_file    = compute_windows.bgi_per_window[wi],
                     donor_re_tsv     = donor_re_tsv,
                     annotation_tsv   = gene_annotation_tsv,
+                    feature_filter_file = compute_windows.feature_filter_files[wi],
                     sample_map_tsv   = sample_mapping_tsv,
                     phenotype_file   = phenotype_files[ct_idx],
                     covariate_file   = covariate_files[ct_idx],
@@ -167,7 +168,7 @@ task compute_windows {
 
     command <<<
         python3 - << 'PYEOF'
-        import csv, json, math
+        import csv, json, math, os
 
         genome_bgen = "~{genome_bgen_path}".strip()
         genome_bgi  = "~{genome_bgi_path}".strip()
@@ -184,43 +185,54 @@ task compute_windows {
         bgen_map = dict(zip(chroms, bgens)) if not genome_bgen else {}
         bgi_map  = dict(zip(chroms, bgis))  if not genome_bgen else {}
 
-        # Read gene annotation (autosomal only)
+        # Read gene annotation (autosomal only) — keep (start, feature_id) tuples
         genes = {}
         with open("~{gene_annotation_tsv}") as f:
             for row in csv.DictReader(f, delimiter='\t'):
                 c = row['chromosome']
                 if not c.isdigit():
                     continue
-                # Only include chromosomes we have bgen data for
                 if not genome_bgen and c not in bgen_map:
                     continue
-                genes.setdefault(int(c), []).append(int(row['start']))
+                genes.setdefault(int(c), []).append((int(row['start']), row['feature_id']))
 
-        windows, win_bgens, win_bgis = [], [], []
+        os.makedirs("feature_filters", exist_ok=True)
+        windows, win_bgens, win_bgis, feature_files = [], [], [], []
         for chrom in sorted(genes):
-            pos = sorted(genes[chrom])
-            n_win = max(1, math.ceil(len(pos) / gpw))
-            chunk = math.ceil(len(pos) / n_win)
+            pairs = sorted(genes[chrom])  # sort by (start, feature_id)
+            n_win = max(1, math.ceil(len(pairs) / gpw))
+            chunk = math.ceil(len(pairs) / n_win)
             for i in range(n_win):
-                sl = pos[i * chunk : (i + 1) * chunk]
-                w_start = max(1, sl[0] - cis)
-                w_end   = sl[-1] + cis
+                sl = pairs[i * chunk : (i + 1) * chunk]
+                starts = [p[0] for p in sl]
+                fids   = [p[1] for p in sl]
+                w_start = max(1, starts[0] - cis)
+                w_end   = starts[-1] + cis
                 windows.append(f"{chrom}:{w_start}-{w_end}")
                 win_bgens.append(genome_bgen if genome_bgen else bgen_map[str(chrom)])
                 win_bgis.append(genome_bgi  if genome_bgen else bgi_map[str(chrom)])
+                # Write per-window feature filter TSV (limix-qtl reads index_col=0)
+                ff_path = f"feature_filters/chr{chrom}_win{i}.tsv"
+                with open(ff_path, 'w') as out:
+                    out.write("feature_id\n")
+                    for fid in fids:
+                        out.write(fid + "\n")
+                feature_files.append(os.path.abspath(ff_path))
 
         print(json.dumps({
-            "windows": windows,
-            "bgens":   win_bgens,
-            "bgis":    win_bgis,
+            "windows":  windows,
+            "bgens":    win_bgens,
+            "bgis":     win_bgis,
+            "features": feature_files,
         }))
         PYEOF
     >>>
 
     output {
-        Array[String] genomic_windows = read_json(stdout())["windows"]
-        Array[String] bgen_per_window = read_json(stdout())["bgens"]
-        Array[String] bgi_per_window  = read_json(stdout())["bgis"]
+        Array[String] genomic_windows    = read_json(stdout())["windows"]
+        Array[String] bgen_per_window    = read_json(stdout())["bgens"]
+        Array[String] bgi_per_window     = read_json(stdout())["bgis"]
+        Array[File]   feature_filter_files = read_json(stdout())["features"]
     }
 
     runtime {
@@ -253,6 +265,7 @@ task run_eqtl_task {
         File    bgen_bgi_file     # matching index file
         File    donor_re_tsv
         File    annotation_tsv
+        File    feature_filter_file  # per-window TSV: only test these features (no boundary duplicates)
         File    sample_map_tsv
         File    phenotype_file
         File    covariate_file
@@ -301,6 +314,7 @@ task run_eqtl_task {
         python -u ~{limix_script} \
             --bgen   "$BGEN_PREFIX" \
             -af      ~{annotation_tsv} \
+            -ff      ~{feature_filter_file} \
             -cf      ~{covariate_file} \
             -pf      ~{phenotype_file} \
             -rf      ~{donor_re_tsv} \

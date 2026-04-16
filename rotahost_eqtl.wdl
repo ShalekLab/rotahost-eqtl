@@ -197,7 +197,9 @@ task compute_windows {
                 genes.setdefault(int(c), []).append((int(row['start']), row['feature_id']))
 
         os.makedirs("feature_filters", exist_ok=True)
-        windows, win_bgens, win_bgis, feature_files = [], [], [], []
+        windows, win_bgens, win_bgis = [], [], []
+        # Use global zero-padded sequence numbers so glob() returns files in window order
+        global_idx = 0
         for chrom in sorted(genes):
             pairs = sorted(genes[chrom])  # sort by (start, feature_id)
             n_win = max(1, math.ceil(len(pairs) / gpw))
@@ -212,27 +214,28 @@ task compute_windows {
                 win_bgens.append(genome_bgen if genome_bgen else bgen_map[str(chrom)])
                 win_bgis.append(genome_bgi  if genome_bgen else bgi_map[str(chrom)])
                 # Write per-window feature filter TSV (limix-qtl reads index_col=0)
-                ff_path = f"feature_filters/chr{chrom}_win{i}.tsv"
+                # 6-digit zero-pad supports up to 999,999 windows; sorts alphabetically = window order
+                ff_path = f"feature_filters/win{global_idx:06d}.tsv"
                 with open(ff_path, 'w') as out:
                     out.write("feature_id\n")
                     for fid in fids:
                         out.write(fid + "\n")
-                feature_files.append(os.path.abspath(ff_path))
+                global_idx += 1
 
         print(json.dumps({
             "windows":  windows,
             "bgens":    win_bgens,
             "bgis":     win_bgis,
-            "features": feature_files,
         }))
         PYEOF
     >>>
 
     output {
-        Array[String] genomic_windows    = read_json(stdout())["windows"]
-        Array[String] bgen_per_window    = read_json(stdout())["bgens"]
-        Array[String] bgi_per_window     = read_json(stdout())["bgis"]
-        Array[File]   feature_filter_files = read_json(stdout())["features"]
+        Array[String] genomic_windows      = read_json(stdout())["windows"]
+        Array[String] bgen_per_window      = read_json(stdout())["bgens"]
+        Array[String] bgi_per_window       = read_json(stdout())["bgis"]
+        # glob returns files in alphabetical order — matches window order via zero-padded names
+        Array[File]   feature_filter_files = glob("feature_filters/win*.tsv")
     }
 
     runtime {

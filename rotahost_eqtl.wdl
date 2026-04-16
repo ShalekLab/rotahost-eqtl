@@ -4,76 +4,107 @@ version 1.0
 # Published on Dockstore: https://dockstore.org/organizations/ShalekLab
 #
 # Implements sc-eQTLGen WG3 approach (Kaptijn et al. 2026)
-# Supports 6 analysis modes:
-#   global | longitudinal | iga_interaction | temporal_igay | temporal_igan | adt
+# Two-step design:
+#   1. compute_windows — splits gene annotation into genomic windows (~215 genes each)
+#   2. run_eqtl_task   — runs limix-qtl per (cell_type × window)
 #
-# Toy test parameters (chr22, B_L1, 10 perms):
-#   cell_types = ["B"]
-#   chromosomes = ["22"]
-#   n_permutations = 10
-#   analysis_mode = "global"
+# Bgen input modes:
+#   Mode 1 (genome-wide):      genome_bgen_path = "gs://.../all_chroms.bgen"
+#   Mode 2 (per-chromosome):   chr_bgen_paths = ["gs://.../chr1.bgen", ..., "gs://.../chr22.bgen"]
 #
-# Full run parameters:
-#   cell_types = ["B","CD4_T","CD8_T","NK","Mono","DC","gdT"]
-#   chromosomes = ["1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22"]
-#   n_permutations = 1000
-#   analysis_mode = "global" (run separately for each mode)
+# Toy test:
+#   cell_types = ["B"], genes_per_window = 9999 (one window per chr)
+#   chr_bgen_paths = ["gs://.../chr22.bgen"], chromosomes = ["22"]
 #
-# Cost monitoring: estimated $0.03 per task (n1-standard-4 preemptible, ~40 min)
-# Set GCP budget alert at $2 for safety; abort if exceeded
+# Full run: 5 analyses × 7 CT × ~53 windows ≈ 1,855 tasks
+# Cost: ~$400 | Wall time: ~8h (all tasks parallel)
 
 workflow rotahost_eqtl {
     input {
-        # Analysis configuration
-        String  analysis_mode      = "global"   # global|longitudinal|iga_interaction|temporal_igay|temporal_igan|adt
-        Array[String] cell_types   = ["B"]      # L1 cell types to analyze
-        Array[String] chromosomes  = ["22"]     # chromosomes to test
-        Int     n_permutations     = 10         # 10 for toy test; 1000 for production
-        Float   maf_filter         = 0.05
-        Float   hwe_filter         = 0.0001
-        Int     cis_window         = 1000000    # ±1 Mb
+        String        analysis_mode    = "longitudinal"
+        Array[String] cell_types       = ["B"]
+        Int           n_permutations   = 100
+        Float         maf_filter       = 0.05
+        Float         hwe_filter       = 0.0001
+        Int           cis_window       = 1000000
 
-        # GCS paths to input files (upload from local before submission)
-        String  gcs_bgen_prefix               # gs://.../ directory containing chr{N}.bgen files
-        String  gcs_kinship_tsv               # gs://.../kinship_matrix.tsv
-        File    gene_annotation_tsv           # local or GCS path to gene annotation
-        File    sample_mapping_tsv            # local or GCS path (no header)
+        # --- Bgen input: provide ONE mode ---
+        # Mode 1: genome-wide bgen (single file, simplest UI)
+        String        genome_bgen_path     = ""
+        String        genome_bgi_path      = ""
+        # Mode 2: per-chromosome bgens (22 entries each)
+        Array[String] chromosomes          = []
+        Array[String] chr_bgen_paths       = []
+        Array[String] chr_bgi_paths        = []
 
-        # Per-cell-type input directories (GCS prefix)
-        String  gcs_phenotype_dir             # gs://.../phenotypes/{analysis_mode}/
-        String  gcs_covariate_dir             # gs://.../covariates/{analysis_mode}/
+        # Windowing: target ~100 genes/window ≈ 3.3h at 120s/gene (long-read pipeline pattern)
+        # Lower = shorter tasks = lower preemption rate; higher = fewer tasks = lower overhead
+        # 100 → ~3,255 tasks, ~20% preemption rate (recommended for full run)
+        # 215 → ~1,855 tasks, ~40% preemption rate
+        Int           genes_per_window     = 100
 
-        # Optional: interaction term for analyses 3-5
-        String? interaction_term              # "iga_status" or "timepoint_group"
+        # Shared input files
+        File          donor_re_tsv
+        File          gene_annotation_tsv
+        File          sample_mapping_tsv
 
-        # Docker image (GHCR → ShalekLab)
-        String  docker_image = "ghcr.io/shaleklab/rotahost-eqtl:latest"
+        # Per-cell-type input files (parallel to cell_types)
+        Array[File]   phenotype_files
+        Array[File]   covariate_files
 
-        # Compute resources
-        Int     cpu     = 2
-        Int     mem_gb  = 8
-        Int     disk_gb = 30
-        Int     preemptible_tries = 3
+        # Interaction term (empty = no interaction; "iga_status" | "pre_post")
+        String interaction_term = ""
+
+        String  docker_image       = "ghcr.io/shts2123/rotahost-eqtl:latest"
+        Int     cpu                = 2
+        Int     mem_gb             = 8
+        Int     disk_gb            = 30
+        # preemptible_tries=1: try once preemptible, then fall back to non-preemptible
+        # (long-read pipeline / spectronaut pattern for tasks >1h)
+        # 0 = always non-preemptible (most reliable); 3 = most preemptible savings
+        Int     preemptible_tries  = 1
+
+        # Optional: GCS folder to copy merged h5 results after merge_results
+        # e.g. "gs://fc-secure-.../results/eqtl"
+        # Leave empty to keep outputs only in the submission path
+        String  results_gcs_dir    = ""
+        # Disk for merge task — genome-wide run: ~53 windows × ~70MB h5 + merged output
+        Int     merge_disk_gb      = 50
     }
 
-    # Scatter over all (cell_type, chromosome) pairs
-    scatter (ct in cell_types) {
-        scatter (chrom in chromosomes) {
+    # Step 1: compute genomic windows from gene annotation
+    call compute_windows {
+        input:
+            gene_annotation_tsv = gene_annotation_tsv,
+            genes_per_window    = genes_per_window,
+            cis_window          = cis_window,
+            genome_bgen_path    = genome_bgen_path,
+            genome_bgi_path     = genome_bgi_path,
+            chromosomes         = chromosomes,
+            chr_bgen_paths      = chr_bgen_paths,
+            chr_bgi_paths       = chr_bgi_paths,
+    }
+
+    # Step 2: scatter over (cell_type × window)
+    scatter (ct_idx in range(length(cell_types))) {
+        scatter (wi in range(length(compute_windows.genomic_windows))) {
             call run_eqtl_task {
                 input:
-                    cell_type        = ct,
-                    chromosome       = chrom,
+                    cell_type        = cell_types[ct_idx],
+                    genomic_window   = compute_windows.genomic_windows[wi],
                     analysis_mode    = analysis_mode,
                     n_permutations   = n_permutations,
                     maf_filter       = maf_filter,
                     hwe_filter       = hwe_filter,
                     cis_window       = cis_window,
-                    bgen_prefix      = "~{gcs_bgen_prefix}chr~{chrom}",
-                    kinship_tsv      = gcs_kinship_tsv,
+                    # String → File coercion: Cromwell localizes these GCS URIs
+                    bgen_file        = compute_windows.bgen_per_window[wi],
+                    bgen_bgi_file    = compute_windows.bgi_per_window[wi],
+                    donor_re_tsv     = donor_re_tsv,
                     annotation_tsv   = gene_annotation_tsv,
                     sample_map_tsv   = sample_mapping_tsv,
-                    phenotype_dir    = gcs_phenotype_dir,
-                    covariate_dir    = gcs_covariate_dir,
+                    phenotype_file   = phenotype_files[ct_idx],
+                    covariate_file   = covariate_files[ct_idx],
                     interaction_term = interaction_term,
                     docker_image     = docker_image,
                     cpu              = cpu,
@@ -82,36 +113,149 @@ workflow rotahost_eqtl {
                     preemptible      = preemptible_tries,
             }
         }
+
+        # Gather: merge all window h5s for this cell type, apply genome-wide FDR
+        call merge_results {
+            input:
+                h5_files            = run_eqtl_task.h5_output,
+                cell_type           = cell_types[ct_idx],
+                analysis_mode       = analysis_mode,
+                interaction_term    = interaction_term,
+                docker_image        = docker_image,
+                results_gcs_dir     = results_gcs_dir,
+                disk_gb             = merge_disk_gb,
+        }
     }
 
     output {
-        Array[Array[File]] h5_results = run_eqtl_task.h5_output
-        Array[Array[File]] log_files  = run_eqtl_task.log_file
+        Array[String]      windows_used = compute_windows.genomic_windows
+        Array[Array[File]] h5_results   = run_eqtl_task.h5_output
+        Array[Array[File]] log_files    = run_eqtl_task.log_file
+        Array[File]        top_results  = merge_results.top_results
+        Array[File]        merged_h5    = merge_results.merged_h5
     }
 
     meta {
         author:      "Sergio Triana, Shalek Lab"
         email:       "strianas@mit.edu"
-        description: "RotaHost sc-eQTL + sc-pQTL pipeline (sc-eQTLGen WG3 approach)"
+        description: "RotaHost sc-eQTL + sc-pQTL (sc-eQTLGen WG3, Kaptijn et al. 2026). Auto-windowing, flexible bgen input."
     }
 }
+
+# ============================================================================
+# Task 1: Compute genomic windows from gene annotation
+# ============================================================================
+# Splits genes into chunks of ~genes_per_window, padded by ±cis_window.
+# Accepts genome-wide OR per-chromosome bgen paths (as Strings, no localization).
+# Outputs parallel arrays of windows + bgen GCS URIs for String→File coercion.
+
+task compute_windows {
+    input {
+        File          gene_annotation_tsv
+        Int           genes_per_window   = 100
+        Int           cis_window         = 1000000
+
+        # Mode 1: genome-wide
+        String        genome_bgen_path   = ""
+        String        genome_bgi_path    = ""
+        # Mode 2: per-chromosome
+        Array[String] chromosomes        = []
+        Array[String] chr_bgen_paths     = []
+        Array[String] chr_bgi_paths      = []
+    }
+
+    command <<<
+        python3 - << 'PYEOF'
+        import csv, json, math
+
+        genome_bgen = "~{genome_bgen_path}".strip()
+        genome_bgi  = "~{genome_bgi_path}".strip()
+        raw_chroms  = "~{sep=',' chromosomes}"
+        raw_bgens   = "~{sep=',' chr_bgen_paths}"
+        raw_bgis    = "~{sep=',' chr_bgi_paths}"
+        cis         = ~{cis_window}
+        gpw         = ~{genes_per_window}
+
+        chroms = [x for x in raw_chroms.split(',') if x]
+        bgens  = [x for x in raw_bgens.split(',') if x]
+        bgis   = [x for x in raw_bgis.split(',') if x]
+
+        bgen_map = dict(zip(chroms, bgens)) if not genome_bgen else {}
+        bgi_map  = dict(zip(chroms, bgis))  if not genome_bgen else {}
+
+        # Read gene annotation (autosomal only)
+        genes = {}
+        with open("~{gene_annotation_tsv}") as f:
+            for row in csv.DictReader(f, delimiter='\t'):
+                c = row['chromosome']
+                if not c.isdigit():
+                    continue
+                # Only include chromosomes we have bgen data for
+                if not genome_bgen and c not in bgen_map:
+                    continue
+                genes.setdefault(int(c), []).append(int(row['start']))
+
+        windows, win_bgens, win_bgis = [], [], []
+        for chrom in sorted(genes):
+            pos = sorted(genes[chrom])
+            n_win = max(1, math.ceil(len(pos) / gpw))
+            chunk = math.ceil(len(pos) / n_win)
+            for i in range(n_win):
+                sl = pos[i * chunk : (i + 1) * chunk]
+                w_start = max(1, sl[0] - cis)
+                w_end   = sl[-1] + cis
+                windows.append(f"{chrom}:{w_start}-{w_end}")
+                win_bgens.append(genome_bgen if genome_bgen else bgen_map[str(chrom)])
+                win_bgis.append(genome_bgi  if genome_bgen else bgi_map[str(chrom)])
+
+        print(json.dumps({
+            "windows": windows,
+            "bgens":   win_bgens,
+            "bgis":    win_bgis,
+        }))
+        PYEOF
+    >>>
+
+    output {
+        Array[String] genomic_windows = read_json(stdout())["windows"]
+        Array[String] bgen_per_window = read_json(stdout())["bgens"]
+        Array[String] bgi_per_window  = read_json(stdout())["bgis"]
+    }
+
+    runtime {
+        docker:      "python:3.11-slim"
+        cpu:         1
+        memory:      "2 GB"
+        disks:       "local-disk 10 SSD"
+        preemptible: 0
+    }
+
+    meta {
+        description: "Splits gene annotation into genomic windows for parallelized eQTL mapping."
+    }
+}
+
+# ============================================================================
+# Task 2: Run limix-qtl per cell type × genomic window
+# ============================================================================
 
 task run_eqtl_task {
     input {
         String  cell_type
-        String  chromosome
+        String  genomic_window    # "CHR:START-END"
         String  analysis_mode
         Int     n_permutations
         Float   maf_filter
         Float   hwe_filter
         Int     cis_window
-        String  bgen_prefix       # GCS prefix without .bgen extension
-        String  kinship_tsv       # GCS path or local path
+        File    bgen_file         # localized by Terra/Cromwell (String→File coercion)
+        File    bgen_bgi_file     # matching index file
+        File    donor_re_tsv
         File    annotation_tsv
         File    sample_map_tsv
-        String  phenotype_dir     # GCS directory prefix
-        String  covariate_dir     # GCS directory prefix
-        String? interaction_term
+        File    phenotype_file
+        File    covariate_file
+        String  interaction_term
         String  docker_image
         Int     cpu
         Int     mem_gb
@@ -119,59 +263,63 @@ task run_eqtl_task {
         Int     preemptible
     }
 
-    String limix_script = if (defined(interaction_term))
+    # Parse window string "CHR:START-END" for output filename
+    # limix-qtl writes {prefix}_{chr}_{start}_{end}.h5 when -gr is specified
+    String chromosome   = sub(genomic_window, ":.*", "")
+    String window_range = sub(genomic_window, ".*:", "")
+    String window_start = sub(window_range, "-.*", "")
+    String window_end   = sub(genomic_window, ".*-", "")
+
+    # NOTE: bgen_prefix must be computed in bash (not WDL String expression)
+    # because WDL File expressions resolve to GCS URIs in String context,
+    # not the localized local path.
+
+    String limix_script = if (interaction_term != "")
         then "/limix_qtl/Limix_QTL/run_interaction_QTL_analysis.py"
         else "/limix_qtl/Limix_QTL/run_QTL_analysis.py"
 
-    String inter_flag = if (defined(interaction_term))
+    String inter_flag = if (interaction_term != "")
         then "-int ~{interaction_term}"
         else ""
 
-    # Phenotype file: denoised_adt for adt mode, expression for others
-    String pheno_suffix = if (analysis_mode == "adt")
-        then "_denoised_adt.csv"
-        else "_expression.tsv"
+    # Output h5 prefix differs by analysis type
+    String h5_prefix = if (interaction_term != "") then "iqtl_results" else "qtl_results"
 
     command <<<
         set -euo pipefail
 
-        # Download BGEN files from GCS
-        gsutil cp "~{bgen_prefix}.bgen"     ./chr~{chromosome}.bgen
-        gsutil cp "~{bgen_prefix}.bgen.bgi" ./chr~{chromosome}.bgen.bgi
-
-        # Download kinship matrix
-        gsutil cp "~{kinship_tsv}" ./kinship_matrix.tsv
-
-        # Download phenotype and covariate files for this cell type
-        gsutil cp "~{phenotype_dir}/~{cell_type}~{pheno_suffix}" \
-                  ./phenotype_~{cell_type}.tsv
-        gsutil cp "~{covariate_dir}/~{cell_type}_covariates.tsv" \
-                  ./covariate_~{cell_type}.tsv
+        echo "=== RotaHost eQTL: ~{cell_type} window ~{genomic_window} ==="
+        echo "Analysis: ~{analysis_mode} | Perms: ~{n_permutations} | Donor RE: chip-indexed identity"
 
         mkdir -p output/
 
-        python ~{limix_script} \
-            --bgen   chr~{chromosome} \
+        # Compute bgen prefix from the localized file path (strip .bgen extension)
+        BGEN_LOCAL="~{bgen_file}"
+        BGEN_PREFIX="${BGEN_LOCAL%.bgen}"
+
+        python -u ~{limix_script} \
+            --bgen   "$BGEN_PREFIX" \
             -af      ~{annotation_tsv} \
-            -cf      ./covariate_~{cell_type}.tsv \
-            -pf      ./phenotype_~{cell_type}.tsv \
-            -rf      ./kinship_matrix.tsv \
+            -cf      ~{covariate_file} \
+            -pf      ~{phenotype_file} \
+            -rf      ~{donor_re_tsv} \
             -smf     ~{sample_map_tsv} \
             -od      output/ \
-            -gr      ~{chromosome} \
+            -gr      ~{genomic_window} \
             -np      ~{n_permutations} \
             -maf     ~{maf_filter} \
             -hwe     ~{hwe_filter} \
             -c -gm gaussnorm \
             -w       ~{cis_window} \
             ~{inter_flag} \
-            > output/run.log 2>&1
+            2>&1 | tee output/run.log
 
-        echo "Completed: ~{cell_type} chr~{chromosome}" >> output/run.log
+        echo "Completed: ~{cell_type} ~{genomic_window}" | tee -a output/run.log
+
     >>>
 
     output {
-        File h5_output = "output/qtl_results_~{chromosome}.h5"
+        File h5_output = "output/~{h5_prefix}_~{chromosome}_~{window_start}_~{window_end}.h5"
         File log_file  = "output/run.log"
     }
 
@@ -182,9 +330,138 @@ task run_eqtl_task {
         disks:        "local-disk ~{disk_gb} SSD"
         preemptible:  preemptible
         maxRetries:   preemptible
+        # NOTE: checkpointFile is NOT supported in GCPBatch mode (Terra backend since June 2025).
+        # The Docker image includes h5 append-mode patches for future use when/if
+        # Terra adds GCPBatch checkpoint support.
     }
 
     meta {
-        description: "Run limix_qtl cis-eQTL or interaction-eQTL for one cell type × chromosome"
+        description: "limix-qtl cis-eQTL per cell type × genomic window. Checkpoint-enabled for preemption resilience."
+    }
+}
+
+# ============================================================================
+# Task 3: Merge per-window h5 results and apply genome-wide FDR
+# ============================================================================
+# Runs after all scatter tasks for one cell type complete.
+# Reads all window h5 files, extracts best SNP per gene, applies BH-FDR.
+
+task merge_results {
+    input {
+        Array[File] h5_files
+        String      cell_type
+        String      analysis_mode
+        String      interaction_term
+        String      docker_image
+        # Optional GCS folder to copy merged h5 (e.g. "gs://fc-.../results/eqtl")
+        String      results_gcs_dir = ""
+        Int         disk_gb         = 50
+    }
+
+    String h5_prefix = if (interaction_term != "") then "iqtl" else "eqtl"
+    String merged_h5_name = "~{h5_prefix}_~{cell_type}_~{analysis_mode}_merged.h5"
+
+    command <<<
+        set -euo pipefail
+
+        python3 -u - << 'EOF'
+        import h5py, numpy as np, os, sys
+
+        h5_paths = "~{sep=' ' h5_files}".split()
+        cell_type = "~{cell_type}"
+        analysis = "~{analysis_mode}"
+        merged_name = "~{merged_h5_name}"
+        results_gcs_dir = "~{results_gcs_dir}".strip()
+
+        print(f"Merging {len(h5_paths)} h5 files for {cell_type} ({analysis})")
+
+        header = "feature_id\tsnp_id\tp_value\tbeta\tbeta_se\tempirical_feature_p_value\tn_snps_tested"
+        rows = []
+
+        # Write merged h5 (all variants for all genes — full summary stats for plotting/colocalization)
+        with h5py.File(merged_name, 'w') as out_f:
+            for h5_path in h5_paths:
+                with h5py.File(h5_path, 'r') as f:
+                    for gene in f.keys():
+                        data = f[gene][:]
+                        if len(data) == 0:
+                            continue
+                        out_f.create_dataset(gene, data=data)
+                        best_idx = int(np.argmin(data['empirical_feature_p_value']))
+                        rows.append((
+                            gene,
+                            data['snp_id'][best_idx].decode(),
+                            float(data['p_value'][best_idx]),
+                            float(data['beta'][best_idx]),
+                            float(data['beta_se'][best_idx]),
+                            float(data['empirical_feature_p_value'][best_idx]),
+                            len(data),
+                        ))
+
+        print(f"  Total genes: {len(rows)}")
+        print(f"  Merged h5 written: {merged_name} ({os.path.getsize(merged_name) / 1e6:.1f} MB)")
+
+        if len(rows) == 0:
+            print("WARNING: No genes found in any h5 file")
+            with open("top_results.tsv", 'w') as f:
+                f.write(header + "\tfdr_gene\n")
+            sys.exit(0)
+
+        # Sort by empirical p-value
+        rows.sort(key=lambda x: x[5])
+
+        # BH-FDR correction across all genes
+        emp_pvals = np.array([r[5] for r in rows])
+        n = len(emp_pvals)
+        ranked = np.argsort(emp_pvals)
+        fdr = np.zeros(n)
+        cummin = 1.0
+        for i in range(n - 1, -1, -1):
+            idx = ranked[i]
+            bh = emp_pvals[idx] * n / (i + 1)
+            cummin = min(cummin, bh)
+            fdr[idx] = min(cummin, 1.0)
+
+        n_egenes = int(np.sum(fdr < 0.05))
+        print(f"  eGenes (FDR<0.05): {n_egenes}")
+
+        with open("top_results.tsv", 'w') as f:
+            f.write(header + "\tfdr_gene\n")
+            for i, row in enumerate(rows):
+                f.write("\t".join(str(x) for x in row) + f"\t{fdr[i]:.6g}\n")
+
+        print(f"  Written to top_results.tsv")
+
+        # Copy merged h5 to user-specified GCS folder if provided
+        if results_gcs_dir:
+            from google.cloud import storage
+            dest = results_gcs_dir.rstrip("/") + "/" + merged_name
+            # dest = "gs://bucket/path/file.h5" → bucket + blob
+            dest_no_prefix = dest[len("gs://"):]
+            bucket_name, blob_path = dest_no_prefix.split("/", 1)
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_path)
+            blob.upload_from_filename(merged_name)
+            print(f"  Uploaded merged h5 to {dest}")
+
+        EOF
+    >>>
+
+    output {
+        File top_results = "top_results.tsv"
+        File merged_h5   = merged_h5_name
+    }
+
+    runtime {
+        docker:      docker_image
+        cpu:         1
+        memory:      "4 GB"
+        disks:       "local-disk ~{disk_gb} SSD"
+        preemptible: 0
+    }
+
+    meta {
+        description: "Merge per-window eQTL h5 results (full variant stats) and compute genome-wide BH-FDR."
     }
 }

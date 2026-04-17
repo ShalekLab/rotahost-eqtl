@@ -314,16 +314,23 @@ task run_eqtl_task {
         BGEN_LOCAL="~{bgen_file}"
         BGEN_PREFIX="${BGEN_LOCAL%.bgen}"
 
-        # Filter sample_mapping to only samples present in this CT's covariate + phenotype files
-        # (interaction script fails on NaN cov rows when sample_mapping has unmatched samples)
+        # Filter sample_mapping to only samples present in:
+        #   (a) this CT's covariate file
+        #   (b) this CT's phenotype file
+        #   (c) the donor random effect matrix (kinship file)
+        # Without (c), interaction script gets NaN kinship rows for unmatched chips.
         python << 'FILTERPY'
         import pandas as pd
         smap = pd.read_csv("~{sample_map_tsv}", sep="\t", header=None, names=["chip","sample"])
         cov  = pd.read_csv("~{covariate_file}", sep="\t", index_col=0)
         ph   = pd.read_csv("~{phenotype_file}", sep="\t", index_col=0, nrows=1)
-        keep = smap[smap["sample"].isin(set(cov.index) & set(ph.columns))]
+        kin  = pd.read_csv("~{donor_re_tsv}", sep="\t", index_col=0, nrows=1)  # just need col names
+        valid_samples = set(cov.index) & set(ph.columns)
+        valid_chips   = set(kin.columns)
+        keep = smap[smap["sample"].isin(valid_samples) & smap["chip"].isin(valid_chips)]
         keep.to_csv("filtered_sample_mapping.tsv", sep="\t", header=False, index=False)
-        print(f"Sample mapping filtered: {len(smap)} -> {len(keep)}")
+        print(f"Sample mapping filtered: {len(smap)} -> {len(keep)} "
+              f"(unique chips: {smap['chip'].nunique()} -> {keep['chip'].nunique()})")
         FILTERPY
 
         python -u ~{limix_script} \

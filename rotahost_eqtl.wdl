@@ -314,6 +314,18 @@ task run_eqtl_task {
         BGEN_LOCAL="~{bgen_file}"
         BGEN_PREFIX="${BGEN_LOCAL%.bgen}"
 
+        # Filter sample_mapping to only samples present in this CT's covariate + phenotype files
+        # (interaction script fails on NaN cov rows when sample_mapping has unmatched samples)
+        python << 'FILTERPY'
+        import pandas as pd
+        smap = pd.read_csv("~{sample_map_tsv}", sep="\t", header=None, names=["chip","sample"])
+        cov  = pd.read_csv("~{covariate_file}", sep="\t", index_col=0)
+        ph   = pd.read_csv("~{phenotype_file}", sep="\t", index_col=0, nrows=1)
+        keep = smap[smap["sample"].isin(set(cov.index) & set(ph.columns))]
+        keep.to_csv("filtered_sample_mapping.tsv", sep="\t", header=False, index=False)
+        print(f"Sample mapping filtered: {len(smap)} -> {len(keep)}")
+        FILTERPY
+
         python -u ~{limix_script} \
             --bgen   "$BGEN_PREFIX" \
             -af      ~{annotation_tsv} \
@@ -321,7 +333,7 @@ task run_eqtl_task {
             -cf      ~{covariate_file} \
             -pf      ~{phenotype_file} \
             -rf      ~{donor_re_tsv} \
-            -smf     ~{sample_map_tsv} \
+            -smf     filtered_sample_mapping.tsv \
             -od      output/ \
             -gr      ~{genomic_window} \
             -np      ~{n_permutations} \

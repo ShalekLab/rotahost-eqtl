@@ -296,7 +296,7 @@ task run_eqtl_task {
         else "/limix_qtl/Limix_QTL/run_QTL_analysis.py"
 
     String inter_flag = if (interaction_term != "")
-        then "-int ~{interaction_term}"
+        then "-it ~{interaction_term}"
         else ""
 
     # Output h5 prefix differs by analysis type

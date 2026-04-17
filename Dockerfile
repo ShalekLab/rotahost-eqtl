@@ -38,11 +38,12 @@ RUN pip install --no-cache-dir \
     limix \
     google-cloud-storage
 
-# Install limix_qtl (apply numpy 2.x compatibility patches)
+# Install limix_qtl (apply numpy 2.x compatibility patches + interaction script syntax fix)
 RUN git clone https://github.com/single-cell-genetics/limix_qtl.git /limix_qtl && \
     sed -i 's/np\.in1d(\(.*\))/np.isin(\1)/g' /limix_qtl/Limix_QTL/qtl_utilities.py && \
     sed -i 's/snpC\.index\[np\.where(snpC==1)\]\.values/snpC[snpC == 1].index.tolist()/g' \
-        /limix_qtl/Limix_QTL/qtl_utilities.py
+        /limix_qtl/Limix_QTL/qtl_utilities.py && \
+    sed -i 's|+").")")|+").")|' /limix_qtl/Limix_QTL/run_interaction_QTL_analysis.py
 
 # NOTE: checkpoint resume patches (patches/checkpoint_resume.py) are NOT applied here.
 # checkpointFile runtime attribute is not supported on GCPBatch (Terra backend since June 2025).
